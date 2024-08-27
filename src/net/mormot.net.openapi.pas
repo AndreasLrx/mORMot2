@@ -67,6 +67,17 @@ type
     function Properties: PDocVariantData;
     property _Property[const aName: RawUtf8]: POpenApiSchema
       read GetPropertyByName;
+    function MultipleOf: Integer;
+    function Maximum: Integer;
+    function ExclusiveMaximum: Boolean;
+    function Minimum: Integer;
+    function ExclusiveMinimum: Boolean;
+    function MaxLength: Integer;
+    function MinLength: Integer;
+    function Pattern: RawUtf8;
+    function MaxItems: Integer;
+    function MinItems: Integer;
+    function UniqueItems: Boolean;
     // high-level OpenAPI Schema Helpers
     function IsArray: boolean;
     function IsObject: boolean;
@@ -112,6 +123,8 @@ type
     function HasDefaultValue: boolean;
     function Required: boolean;
     function Schema: POpenApiSchema;
+    // high-level OpenAPI Schema Helpers
+    function ValidationCode(LineIndent: RawUtf8 = ''): RawUtf8;
   end;
   /// a dynamic array of pointers wrapper to OpenAPI Parameter(s)
   POpenApiParameterDynArray = array of POpenApiParameter;
@@ -461,6 +474,61 @@ begin
     result := nil;
 end;
 
+function TOpenApiSchema.MultipleOf: Integer;
+begin
+  result := Data.I['multipleOf'];
+end;
+
+function TOpenApiSchema.Maximum: Integer;
+begin
+  result := Data.I['maximum'];
+end;
+
+function TOpenApiSchema.ExclusiveMaximum: Boolean;
+begin
+  result := Data.B['exclusiveMaximum'];
+end;
+
+function TOpenApiSchema.Minimum: Integer;
+begin
+  result := Data.I['minimum'];
+end;
+
+function TOpenApiSchema.ExclusiveMinimum: Boolean;
+begin
+  result := Data.B['exclusiveMinimum'];
+end;
+
+function TOpenApiSchema.MaxLength: Integer;
+begin
+  result := Data.I['maxLength'];
+end;
+
+function TOpenApiSchema.MinLength: Integer;
+begin
+  result := Data.I['minLength'];
+end;
+
+function TOpenApiSchema.Pattern: RawUtf8;
+begin
+  result := Data.U['pattern'];
+end;
+
+function TOpenApiSchema.MaxItems: Integer;
+begin
+  result := Data.I['maxItems'];
+end;
+
+function TOpenApiSchema.MinItems: Integer;
+begin
+  result := Data.I['minItems'];
+end;
+
+function TOpenApiSchema.UniqueItems: Boolean;
+begin
+  result := Data.B['uniqueItems'];
+end;
+
 function TOpenApiSchema.GetPropertyByName(const aName: RawUtf8): POpenApiSchema;
 begin
   if not Properties^.GetAsObject(aName, PDocVariantData(result)) then
@@ -615,6 +683,71 @@ function TOpenApiParameter.Schema: POpenApiSchema;
 begin
   if not Data.GetAsObject('schema', PDocVariantData(result)) then
     result := nil;
+end;
+
+function TOpenApiParameter.ValidationCode(LineIndent: RawUtf8): RawUtf8;
+var
+  aName: RawUtf8;
+  HasMin, HasMax: Boolean;
+begin
+  aName := AsPascalName;
+
+  result := '';
+  if (AsSchema^._Type = 'integer') or (AsSchema^._Type = 'number') then
+  begin
+    HasMin := Data.Exists('minimum');
+    HasMax := Data.Exists('maximum');
+    if HasMin or HasMax then
+    begin
+      Append(result, LineIndent, '  if (');
+      if HasMin then
+      begin
+        Append(result, aName, ' <');
+        if not AsSchema^.ExclusiveMinimum then
+          Append(result, '=');
+        Append(result, [' ', VariantToUtf8(Data.Value['minimum']), ')']);
+      end;
+      if HasMax then
+      begin
+        if HasMin then
+          Append(result, ' or (');
+        Append(result, aName, ' >');
+        if not AsSchema^.ExclusiveMaximum then
+          Append(result, '=');
+        Append(result, [' ', VariantToUtf8(Data.Value['maximum']), ')']);
+      end;
+      Append(result, [' then', LineEnding, '    raise Exception.Create(''Invalid parameters'')', LineEnding]);
+    end;
+    if Data.Exists('multipleOf') then
+       Append(result, ['  if (', aName, ' mod ', VariantToUtf8(Data.Value['multipleOf']), ') <> 0 then', LineEnding, '    raise Exception.Create(''Invalid parameters'')', LineEnding]);
+  end
+  else if (AsSchema^._Type = 'string') or (AsSchema^._Type = 'array') then
+  begin
+    if AsSchema^._Type = 'string' then
+    begin
+      HasMin := Data.Exists('minLength');
+      HasMax := Data.Exists('maxLength');
+    end else
+    begin
+      HasMin := Data.Exists('minItems');
+      HasMax := Data.Exists('maxItems');
+    end;
+    if HasMin or HasMax then
+    begin
+      Append(result, LineIndent, '  if (');
+      if HasMin then
+        Append(result, ['Length(', aName, ') < ', VariantToUtf8(Data.Value['minLength']), ')']);
+      if HasMax then
+      begin
+        if HasMin then
+          Append(result, ' or (');
+        Append(result, ['Length(', aName, ') > ', VariantToUtf8(Data.Value['maximum']), ')']);
+      end;
+      Append(result, [' then', LineEnding, '    raise Exception.Create(''Invalid parameters'')', LineEnding]);
+    end;
+    // TODO: Pattern (regex) for string types. Maybe as unit const regex to compile only once ?
+    // TODO: UniqueItems for array type
+  end;
 end;
 
 function TOpenApiParameter.AsPascalName: RawUtf8;
@@ -1020,6 +1153,7 @@ begin
   Action := BasePath + fPath;
   ActionArgs := nil;
   QueryParameters.InitObject([], JSON_FAST);
+  result := FormatUtf8('%%begin%', [Declaration(ClassName, Parser), LineEnding, LineEnding]);
 
   Parameters := GetAllParameters;
   for i := 0 to high(Parameters) do
@@ -1027,6 +1161,7 @@ begin
     Param := Parameters[i];
     ParamType := TPascalType.LoadFromSchema(Parser, Param^.AsSchema);
     try
+      Append(result, Param^.ValidationCode('  '));
       if Param^._In = 'path' then
       begin
         Action := StringReplaceAll(Action, FormatUtf8('{%}', [Param^.Name]), '%');
@@ -1041,9 +1176,7 @@ begin
     end;
   end;
 
-   result := FormatUtf8('%%begin%  JsonClient.Request(''%'', ''%''',
-     [Declaration(ClassName, Parser), Parser.LineEnd, Parser.LineEnd,
-      ToText(fMethod), Action]);
+   Append(result, ['  JsonClient.Request(''', ToText(fMethod), ''', ''', Action, '''']);
    // Path parameters
    if Length(ActionArgs) > 0 then
    begin
